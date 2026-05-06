@@ -15,6 +15,8 @@ from bson import json_util
 from datetime import datetime
 from scipy.stats import ks_2samp
 import time
+import scipy.stats as stats
+
 
 load_dotenv()
 
@@ -34,12 +36,16 @@ def load_data_from_s3():
     """Pulls the latest pipeline output from a PUBLIC AWS S3 bucket."""
     try:
         bucket_name = 'atharv-supply-chain-project'
-        file_name = 'model_v2_probabilistic_asymmetric_output.csv'
+        file_name = 'model_v7_2026_forecast.csv'
         
         url = f"https://{bucket_name}.s3.amazonaws.com/{file_name}"
         
         df = pd.read_csv(url)
         df['Date'] = pd.to_datetime(df['Date'])
+        df = df.rename(columns={
+        'P05_Forecast': 'Lower_Bound_95CI',
+        'P95_Forecast': 'Upper_Bound_95CI'
+        })
         return df
         
     except Exception as e:
@@ -57,282 +63,406 @@ def load_data_from_s3():
 
 df = load_data_from_s3()
 
-latest_week = df.iloc[-1]
-previous_week = df.iloc[-2]
+from datetime import datetime, timedelta
 
-current_sales = latest_week['Actual_Sales']
-sales_delta = current_sales - previous_week['Actual_Sales']
+st.markdown("### Command Center")
 
-current_forecast = latest_week['Expected_Forecast']
-forecast_error = current_sales - current_forecast
+@st.cache_data(ttl=60) # Caches the DB query for 60 seconds to prevent overwhelming the connection
+def fetch_live_mongo_metrics():
+    """Aggregates live sales and event data directly from MongoDB."""
+    try:
+        mongo_client = pymongo.MongoClient(MONGO_URI, serverSelectionTimeoutMS=2000)
+        db = mongo_client["supply_chain"]
+        collection = db["supply_chain_data"]
+        
+        now = datetime.utcnow()
+        one_week_ago = now - timedelta(days=7)
+        two_weeks_ago = now - timedelta(days=14)
+        
+        current_week_sales = list(collection.aggregate([
+            {"$match": {"timestamp": {"$gte": one_week_ago}, "event_type": "normal_sale"}},
+            {"$group": {"_id": None, "total_sales": {"$sum": "$quantity"}, "order_count": {"$sum": 1}}}
+        ]))
+        
+        prev_week_sales = list(collection.aggregate([
+            {"$match": {"timestamp": {"$gte": two_weeks_ago, "$lt": one_week_ago}, "event_type": "normal_sale"}},
+            {"$group": {"_id": None, "total_sales": {"$sum": "$quantity"}}}
+        ]))
+        
+        critical_events = list(collection.aggregate([
+            {"$match": {"timestamp": {"$gte": one_week_ago}, "event_type": {"$in": ["anomaly", "stockout", "delay"]}}},
+            {"$group": {"_id": "$event_type", "count": {"$sum": 1}}}
+        ]))
+        
+        curr_sales_vol = current_week_sales[0]["total_sales"] if current_week_sales else 0
+        prev_sales_vol = prev_week_sales[0]["total_sales"] if prev_week_sales else 0
+        
+        events_dict = {doc["_id"]: doc["count"] for doc in critical_events}
+        stockouts = events_dict.get("stockout", 0)
+        anomalies = events_dict.get("anomaly", 0)
+        delays = events_dict.get("delay", 0)
+        
+        return {
+            "status": "success",
+            "current_sales": curr_sales_vol,
+            "prev_sales": prev_sales_vol,
+            "stockouts": stockouts,
+            "anomalies": anomalies,
+            "delays": delays,
+            "last_synced": now.strftime("%H:%M:%S UTC")
+        }
+        
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
-total_anomalies = df['Anomaly_Flag'].sum() if 'Anomaly_Flag' in df.columns else random.randint(1, 5)
+live_data = fetch_live_mongo_metrics()
 
-st.markdown("### Current Week Operations")
-col1, col2, col3, col4 = st.columns(4)
+# Extract the static forecast expectations from the S3 model data
+latest_forecast = df['Expected_Forecast'].iloc[-1] if not df.empty else 0
+p95_boundary = df['Upper_Bound_95CI'].iloc[-1] if not df.empty else 0
 
-with col1:
-    st.metric(label="Actual Weekly Sales", value=f"{int(current_sales):,}", delta=f"{int(sales_delta):,} vs last week")
-with col2:
-    st.metric(label="Model Forecast", value=f"{int(current_forecast):,}", delta=f"{int(forecast_error):,} unit error", delta_color="inverse")
-with col3:
-    st.metric(label="System Health", value="Online", delta="AWS S3 Synced")
-with col4:
-    st.metric(label="Detected Anomalies (YTD)", value=f"{int(total_anomalies)}", delta="Review Required", delta_color="inverse")
+if live_data["status"] == "success":
+    curr_sales = live_data["current_sales"]
+    sales_delta = curr_sales - live_data["prev_sales"]
+    
+    forecast_variance = curr_sales - latest_forecast
+    variance_pct = (forecast_variance / latest_forecast * 100) if latest_forecast > 0 else 0
+    
+    risk_ratio = (curr_sales / p95_boundary * 100) if p95_boundary > 0 else 0
+    total_incidents = live_data["stockouts"] + live_data["anomalies"] + live_data["delays"]
 
-st.divider()
+    col1, col2, col3, col4, col5 = st.columns(5)
+    
+    with col1:
+        st.metric(
+            label="Live Weekly Volume", 
+            value=f"{int(curr_sales):,}", 
+            delta=f"{int(sales_delta):,} vs last week"
+        )
+    
+    with col2:
+        st.metric(
+            label="Forecast Variance", 
+            value=f"{int(forecast_variance):,}", 
+            delta=f"{variance_pct:.1f}% vs XGBoost",
+            delta_color="inverse" # Shows red if demand is surging higher than expected
+        )
+        
+    with col3:
+        st.metric(
+            label="P95 Risk Limit", 
+            value=f"{risk_ratio:.1f}%", 
+            delta=f"{int(p95_boundary - curr_sales):,} units buffer",
+            help="How close current live sales are to breaching the model's 95% Confidence Interval."
+        )
+        
+    with col4:
+        st.metric(
+            label="Active Grid Incidents", 
+            value=f"{total_incidents}", 
+            delta=f"{live_data['stockouts']} Stockouts",
+            delta_color="inverse"
+        )
+        
+    with col5:
+        st.metric(
+            label="MongoDB Status", 
+            value="Connected", 
+            delta=f"Sync: {live_data['last_synced']}",
+            delta_color="normal"
+        )
+        
+    # Visual buffer bar
+    st.progress(min(risk_ratio / 100, 1.0), text="Current Demand vs. P95 Risk Boundary")
 
-st.markdown("### Model Forecast vs. Actual Demand")
+else:
+    st.error(f"MongoDB Connection Failed: {live_data.get('message')}")
+
+
+st.markdown("### Forecast vs. Live Demand")
+st.markdown("Comparing the hybrid model's 95% risk boundaries against real-time streaming actuals from MongoDB.")
+
+@st.cache_data(ttl=60)
+def fetch_live_chart_data():
+    """Aggregates daily sales and pulls live anomalies directly from MongoDB."""
+    try:
+        mongo_client = pymongo.MongoClient(MONGO_URI, serverSelectionTimeoutMS=2000)
+        db = mongo_client["supply_chain"]
+        collection = db["supply_chain_data"]
+        
+        # Fetch normal daily sales aggregates
+        pipeline = [
+            {"$match": {"event_type": "normal_sale", "timestamp": {"$exists": True}}},
+            {"$group": {
+                "_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$timestamp"}},
+                "daily_sales": {"$sum": "$quantity"}
+            }},
+            {"$sort": {"_id": 1}}
+        ]
+        sales_results = list(collection.aggregate(pipeline))
+        
+        live_sales_df = pd.DataFrame(sales_results)
+        if not live_sales_df.empty:
+            live_sales_df.columns = ['Date', 'Live_Actuals']
+            live_sales_df['Date'] = pd.to_datetime(live_sales_df['Date'])
+            
+        # critical anomalies and stockouts
+        anomalies_cursor = collection.find({"event_type": {"$in": ["anomaly", "stockout"]}})
+        live_anomalies_df = pd.DataFrame(list(anomalies_cursor))
+        
+        return live_sales_df, live_anomalies_df
+        
+    except Exception as e:
+        st.warning(f"Database connection error for timeseries: {e}")
+        return pd.DataFrame(), pd.DataFrame()
+
+# Fetch the live MongoDB data
+live_sales_df, live_anomalies_df = fetch_live_chart_data()
 
 fig = go.Figure()
 
-fig.add_trace(go.Scatter(
-    x=pd.concat([df['Date'], df['Date'][::-1]]),
-    y=pd.concat([df['Upper_Bound_95CI'], df['Lower_Bound_95CI'][::-1]]),
-    fill='toself',
-    fillcolor='rgba(44, 160, 44, 0.2)',
-    line=dict(color='rgba(255,255,255,0)'),
-    hoverinfo="skip",
-    showlegend=True,
-    name='95% Risk Boundary'
-))
-
-fig.add_trace(go.Scatter(
-    x=df['Date'], y=df['Expected_Forecast'],
-    mode='lines',
-    line=dict(color='#2ca02c', width=3),
-    name='XGBoost Expected Forecast'
-))
-
-fig.add_trace(go.Scatter(
-    x=df['Date'], y=df['Actual_Sales'],
-    mode='lines+markers',
-    line=dict(color='black', width=2),
-    marker=dict(size=6, color='black'),
-    name='Actual Transactions'
-))
-
-if 'Anomaly_Flag' in df.columns:
-    anomalies = df[df['Anomaly_Flag'] == 1]
+if not df.empty:
     fig.add_trace(go.Scatter(
-        x=anomalies['Date'], y=anomalies['Actual_Sales'],
-        mode='markers',
-        marker=dict(color='red', size=12, symbol='x'),
-        name='System Anomalies'
+        x=pd.concat([df['Date'], df['Date'][::-1]]),
+        y=pd.concat([df['Upper_Bound_95CI'], df['Lower_Bound_95CI'][::-1]]),
+        fill='toself',
+        fillcolor='rgba(44, 160, 44, 0.2)',
+        line=dict(color='rgba(255,255,255,0)'),
+        hoverinfo="skip",
+        showlegend=True,
+        name='95% Risk Boundary'
     ))
 
+    fig.add_trace(go.Scatter(
+        x=df['Date'], 
+        y=df['Expected_Forecast'],
+        mode='lines',
+        line=dict(color='#2ca02c', width=2, dash='dash'),
+        name='Model Expected Forecast'
+    ))
 
+if not live_sales_df.empty:
+    fig.add_trace(go.Scatter(
+        x=live_sales_df['Date'], 
+        y=live_sales_df['Live_Actuals'],
+        mode='lines',
+        line=dict(color='black', width=3),
+        name='Live Transactions (MongoDB)'
+    ))
+else:
+    fig.add_trace(go.Scatter(
+        x=df['Date'], y=df['Actual_Sales'],
+        mode='lines', line=dict(color='black', width=3),
+        name='Historical Transactions (Fallback)'
+    ))
+
+if not live_anomalies_df.empty and 'timestamp' in live_anomalies_df.columns:
+    for _, row in live_anomalies_df.iterrows():
+        is_stockout = row.get('event_type') == 'stockout'
+        marker_color = '#d62728' if is_stockout else '#ff7f0e' # Red for stockouts, Orange for anomalies
+        marker_symbol = 'x' if is_stockout else 'circle'
+        
+        fig.add_trace(go.Scatter(
+            x=[row['timestamp']], 
+            y=[row.get('quantity', 0)],
+            mode='markers',
+            marker=dict(color=marker_color, size=14, symbol=marker_symbol, line=dict(color='white', width=2)),
+            name=row.get('event_type', 'Anomaly').title(),
+            showlegend=False, 
+            hovertemplate=f"<b>Date:</b> %{{x}}<br>" +
+                          f"<b>Quantity:</b> %{{y}}<br>" +
+                          f"<b>Alert:</b> {row.get('description', 'Anomaly Detected')}<extra></extra>"
+        ))
 
 fig.update_layout(
     height=500,
     margin=dict(l=0, r=0, t=10, b=0),
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    legend=dict(
+        orientation="h", 
+        yanchor="bottom", y=1.02, 
+        xanchor="right", x=1,
+        bgcolor="rgba(255,255,255,0.8)"
+    ),
     hovermode="x unified",
     xaxis_title="Date",
-    yaxis_title="Units Sold"
+    yaxis_title="Units Sold",
+    template="plotly_white", 
+    xaxis=dict(showgrid=True, gridcolor='#e0e0e0'),
+    yaxis=dict(showgrid=True, gridcolor='#e0e0e0')
 )
 
-chart_container = st.container()
+st.plotly_chart(fig, use_container_width=True)
 
 st.divider()
-st.markdown("### 🎛️ Stress Test Simulator")
-st.markdown("Inject artificial demand shocks to test inventory resilience.")
+st.markdown("### Dynamic Risk & Inventory Optimization")
+st.markdown("Simulate financial exposure based on specific inventory decisions. Toggle Newsvendor logic for perishable/seasonal goods.")
 
-demand_shock = st.slider("Demand Shock (%)", min_value=-50, max_value=100, value=0, step=5)
+current_mean = df['Expected_Forecast'].iloc[-1]
+current_upper = df['Upper_Bound_95CI'].iloc[-1]
+estimated_std = (current_upper - current_mean) / 1.96
 
-if demand_shock != 0:
-    shock_multiplier = 1 + (demand_shock / 100)
-    
-    df['Simulated_Forecast'] = df['Expected_Forecast'] * shock_multiplier
-    df['Simulated_Lower_CI'] = df['Lower_Bound_95CI'] * shock_multiplier
-    df['Simulated_Upper_CI'] = df['Upper_Bound_95CI'] * shock_multiplier
-    
-    fig.add_trace(go.Scatter(
-        x=pd.concat([df['Date'], df['Date'][::-1]]),
-        y=pd.concat([df['Simulated_Upper_CI'], df['Simulated_Lower_CI'][::-1]]),
-        fill='toself',
-        fillcolor='rgba(255, 165, 0, 0.2)',
-        line=dict(color='rgba(255,255,255,0)'),
-        hoverinfo="skip",
-        showlegend=True,
-        name=f'Simulated 95% Risk Boundary'
-    ))
+is_newsvendor = st.checkbox("Enable Newsvendor Logic (Single-Period / Perishable Goods)", value=True, 
+                            help="If checked, unsold goods are liquidated at Buyback Value. If unchecked, goods are rolled over and only incur Holding Costs.")
 
-    fig.add_trace(go.Scatter(
-        x=df['Date'], y=df['Simulated_Forecast'],
-        mode='lines',
-        line=dict(color='orange', width=2, dash='dash'),
-        name=f'Stress Test ({demand_shock}% Shock)'
-    ))
-        
-chart_container.plotly_chart(fig, use_container_width=True)
+col_fin1, col_fin2, col_fin3, col_fin4 = st.columns(4)
+with col_fin1:
+    unit_cost = st.number_input("Unit Cost ($)", min_value=0.0, value=50.0, step=5.0)
+with col_fin2:
+    retail_price = st.number_input("Retail Price ($)", min_value=0.0, value=150.0, step=5.0)
+with col_fin3:
+    holding_cost = st.number_input("Holding Cost per Unit ($)", min_value=0.0, value=5.0, step=1.0)
+with col_fin4:
+    buyback_value = st.number_input("Salvage/Buyback Value ($)", min_value=0.0, value=30.0, step=5.0, disabled=not is_newsvendor)
 
-with st.expander("🔍 View Raw Pipeline Output"):
-    st.dataframe(df.tail(10), use_container_width=True)
+cost_of_underage = max(0, retail_price - unit_cost)
 
-
-import scipy.stats as stats
-
-st.divider()
-st.markdown("### 🔬 Advanced Statistical Diagnostics")
-
-df_clean = df.dropna(subset=['Actual_Sales', 'Expected_Forecast']).copy()
-df_clean['Residuals'] = df_clean['Actual_Sales'] - df_clean['Expected_Forecast']
-
-col_stat1, col_stat2 = st.columns(2)
-
-with col_stat1:
-    st.markdown("#### Financial Tail Risk (CVaR)")
-    st.markdown("Calculates the **Expected Shortfall** in the worst 5% of Monte Carlo scenarios.")
-    
-    tail_risk_events = df_clean[df_clean['Actual_Sales'] > df_clean['Upper_Bound_95CI']]
-    
-    if len(tail_risk_events) > 0:
-        cvar_units = (tail_risk_events['Actual_Sales'] - tail_risk_events['Upper_Bound_95CI']).mean()
-        cvar_dollars = cvar_units * 25.00
-        st.error(f"**95% CVaR (Expected Shortfall):** {int(cvar_units):,} units / ${cvar_dollars:,.2f}")
-        st.caption("If a 5% black-swan demand spike occurs, expect an average shortage cost of this magnitude.")
-    else:
-        st.success("**95% CVaR:** $0.00")
-        st.caption("Historical data shows no catastrophic breaches of the 95% upper risk boundary.")
-
-with col_stat2:
-    st.markdown("#### Residual Error Distribution")
-    st.markdown("Proves the XGBoost model has extracted all patterns, leaving only random noise.")
-    
-    skew = stats.skew(df_clean['Residuals'])
-    kurt = stats.kurtosis(df_clean['Residuals'])
-    
-    fig_hist = go.Figure()
-    fig_hist.add_trace(go.Histogram(
-        x=df_clean['Residuals'],
-        nbinsx=20,
-        marker_color='#1f77b4',
-        opacity=0.75,
-        name='Error Count'
-    ))
-    
-    fig_hist.update_layout(
-        height=200,
-        margin=dict(l=0, r=0, t=10, b=0),
-        xaxis_title="Prediction Error (Units)",
-        yaxis_title="Frequency",
-        showlegend=False
-    )
-    st.plotly_chart(fig_hist, use_container_width=True)
-    st.caption(f"**Skewness:** {skew:.2f} | **Kurtosis:** {kurt:.2f} (Values near 0 indicate a highly unbiased model).")
-
-
-
-
-df = pd.read_csv('supply_chain_3yr_data.csv')
-
-first_product = '22197' 
-historical_demand = df[first_product].dropna().values
-
-np.random.seed(42)
-bootstrapped_base = np.random.choice(historical_demand, size=1000, replace=True)
-
-drift_multipliers = np.linspace(1.0, 1.30, 1000)
-simulated_future_stream = np.round(bootstrapped_base * drift_multipliers)
-
-future_df = pd.DataFrame({'Quantity': simulated_future_stream})
-future_df.to_csv('future_stream_data.csv', index=False)
-
-print(f"Generated {len(future_df)} bootstrapped streaming records for SKU {first_product}!")
-
-
-
-
-baseline_mean = 2500 
-baseline_std = 300
-training_actuals = np.random.normal(baseline_mean, baseline_std, 1000)
-
-st.divider()
-st.markdown("### Local Data Drift Monitor")
-st.markdown("Ingesting bootstrapped transaction batches locally. The system continuously compares live distributions against the training baseline to detect model decay.")
-
-@st.cache_data
-def load_local_stream_data():
-    try:
-        return pd.read_csv('future_stream_data.csv')
-    except Exception as e:
-        st.error(f"Failed to find 'future_stream_data.csv': {e}")
-        return pd.DataFrame()
-
-future_df = load_local_stream_data()
-
-if not future_df.empty:
-    true_mean = future_df['Quantity'].iloc[:100].mean()
-    true_std = future_df['Quantity'].iloc[:100].std()
-    
-    np.random.seed(42)
-    training_actuals = np.random.normal(true_mean, true_std, 1000)
+if is_newsvendor:
+    cost_of_overage = max(0, (unit_cost - buyback_value) + holding_cost) 
 else:
-    training_actuals = np.array([])
+    cost_of_overage = holding_cost 
+
+if (cost_of_overage + cost_of_underage) > 0:
+    critical_ratio = cost_of_underage / (cost_of_overage + cost_of_underage)
+else:
+    critical_ratio = 0.5
+
+# Calculate Mathematical Optimum
+target_z_score = stats.norm.ppf(critical_ratio)
+optimal_inventory = current_mean + (target_z_score * estimated_std)
+
+st.markdown("#### Order Simulator")
+user_order_qty = st.slider(
+    "Adjust Planned Inventory Order:",
+    min_value=int(current_mean * 0.5), 
+    max_value=int(current_mean * 1.5), 
+    value=int(optimal_inventory), # Defaults to the mathematical optimal!
+    step=10
+)
+
+z_user = (user_order_qty - current_mean) / estimated_std
+
+pdf_z = stats.norm.pdf(z_user)
+cdf_z = stats.norm.cdf(z_user)
+
+exp_shortage_units = estimated_std * (pdf_z - z_user * (1 - cdf_z))
+exp_overage_units = (user_order_qty - current_mean) + exp_shortage_units
+
+shortage_risk_dollars = exp_shortage_units * cost_of_underage
+overage_risk_dollars = exp_overage_units * cost_of_overage
+total_expected_cost = shortage_risk_dollars + overage_risk_dollars
+
+col_res1, col_res2, col_res3 = st.columns(3)
+
+with col_res1:
+    st.metric(label="Expected Shortage Risk", value=f"${shortage_risk_dollars:,.2f}", delta=f"{int(exp_shortage_units)} units short", delta_color="inverse")
+with col_res2:
+    st.metric(label="Expected Overage Risk", value=f"${overage_risk_dollars:,.2f}", delta=f"{int(exp_overage_units)} units over", delta_color="inverse")
+with col_res3:
+    st.metric(label="Total Financial Exposure", value=f"${total_expected_cost:,.2f}", help="Sum of Shortage Risk and Overage Risk. The optimal order quantity minimizes this number.")
+
+user_percentile = cdf_z * 100
+
+st.info(f"""
+**What does this mean?** Ordering **{user_order_qty:,} units** places your inventory at the **{user_percentile:.1f}th percentile** of the model's forecasted probability. 
+* This means there is a **{user_percentile:.1f}% chance** that actual demand will fall at or below your inventory limit (preventing a stockout).
+* Conversely, there remains a **{(100 - user_percentile):.1f}% chance** of a demand surge exceeding your stock.
+""")
 
 st.divider()
 st.markdown("### Data Drift Monitor")
-st.markdown("Ingesting bootstrapped transaction batches locally. The system continuously compares live distributions against the training baseline to detect model decay.")
+st.markdown("Continuously comparing live MongoDB transaction volumes against the training baseline to detect model decay.")
 
-col1, col2 = st.columns([1, 2])
-with col1:
-    status_placeholder = st.empty()
-with col2:
-    chart_placeholder = st.empty()
+training_baseline = df['Actual_Sales'].dropna().values
 
-if not future_df.empty:
-    local_data_stream = future_df['Quantity'].tolist()
+def check_mongo_data_drift(baseline_data, sample_size=100):
+    try:
+        mongo_client = pymongo.MongoClient(MONGO_URI, serverSelectionTimeoutMS=2000)
+        db = mongo_client["supply_chain"]
+        collection = db["supply_chain_data"]
         
-    if st.button("Initialize Local Data Stream", type="primary"):
+        cursor = collection.find({"quantity": {"$exists": True}}).sort("_id", pymongo.DESCENDING).limit(sample_size)
+        live_data = [doc["quantity"] for doc in cursor]
         
-        live_data_buffer = []
-        batch_size = 5
-        
-        for i in range(0, len(local_data_stream), batch_size):
+        if len(live_data) < 10:
+            return "warning", "Not enough live data in MongoDB to run a reliable KS-Test. Waiting for more transactions...", []
             
-            current_batch = local_data_stream[i : i + batch_size]
-            live_data_buffer.extend(current_batch)
+        ks_stat, p_value = ks_2samp(baseline_data, live_data)
+        
+        if p_value < 0.05:
+            return "error", f" **DATA DRIFT DETECTED** (p-value: {p_value:.4f})\n\nThe live data distribution has significantly shifted from the training baseline. Model retraining is recommended.", live_data
+        else:
+            return "success", f" **No Data Drift Detected** (p-value: {p_value:.4f})\n\n", live_data
             
-            if len(live_data_buffer) > 200:
-                live_data_buffer = live_data_buffer[-200:]
-                
-            if len(live_data_buffer) > 50:
-                ks_stat, p_value = ks_2samp(training_actuals, live_data_buffer)
-                
-                if p_value < 0.05:
-                    status_placeholder.error(f"**DATA DRIFT DETECTED**\n\n**Batch Index:** {i}\nThe live bootstrapped stream has statistically deviated from the training baseline.\n\n**P-Value:** {p_value:.5f}\n\n**Action:** Model retraining required.")
-                else:
-                    status_placeholder.success(f"**STREAM HEALTHY**\n\n**Batch Index:** {i}\nLive data matches training statistical distributions.\n\n**P-Value:** {p_value:.4f}")
-                    
-                fig = go.Figure()
-                
-                fig.add_trace(go.Histogram(
-                    x=training_actuals, histnorm='probability', name='Training Baseline',
-                    opacity=0.6, marker_color='gray', nbinsx=30
-                ))
-                
-                fig.add_trace(go.Histogram(
-                    x=live_data_buffer, histnorm='probability', name='Live Window',
-                    opacity=0.75, marker_color='red' if p_value < 0.05 else '#1f77b4', nbinsx=20
-                ))
+    except Exception as e:
+        return "warning", f" **Database Connection Error:** Could not read from MongoDB. ({str(e)})", []
 
-                min_val = min(min(training_actuals), min(live_data_buffer)) * 0.8
-                max_val = max(max(training_actuals), max(live_data_buffer)) * 1.2
+status_type, message, live_data_stream = check_mongo_data_drift(training_baseline)
 
-                fig.update_layout(
-                    barmode='overlay', height=350, margin=dict(l=0, r=0, t=10, b=0),
-                    xaxis=dict(title="Sales Volume (Units)", range=[min_val, max_val]), 
-                    yaxis_title="Probability Density",
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-                )
-                
-                chart_placeholder.plotly_chart(fig, use_container_width=True)
-                
-            time.sleep(0.15) 
+if status_type == "error":
+    st.error(message)
+elif status_type == "success":
+    st.success(message)
 else:
-    st.warning("Generate 'future_stream_data.csv' to initialize the MLOps monitor.")
+    st.warning(message)
+    
+if len(live_data_stream) > 0:
+    fig_drift = go.Figure()
+    
+    min_val = min(np.min(training_baseline), np.min(live_data_stream))
+    max_val = max(np.max(training_baseline), np.max(live_data_stream))
+    x_curve = np.linspace(min_val, max_val, 200)
 
+    fig_drift.add_trace(go.Histogram(
+        x=training_baseline, 
+        histnorm='probability density', 
+        name='Training Baseline',
+        opacity=0.5, 
+        marker_color='#1f77b4',
+        nbinsx=30
+    ))
+    
+    base_mean = np.mean(training_baseline)
+    base_std = np.std(training_baseline)
+    fig_drift.add_trace(go.Scatter(
+        x=x_curve, 
+        y=stats.norm.pdf(x_curve, base_mean, base_std),
+        mode='lines',
+        line=dict(color='#85c1e9', width=2, dash='dot'),
+        name='Baseline Bell Curve'
+    ))
+
+    live_color = '#d62728' if status_type == "error" else '#2ca02c'
+    
+    fig_drift.add_trace(go.Histogram(
+        x=live_data_stream, 
+        histnorm='probability density', 
+        name='Live MongoDB Data',
+        opacity=0.6, 
+        marker_color=live_color, 
+        nbinsx=20
+    ))
+    
+    live_mean = np.mean(live_data_stream)
+    live_std = np.std(live_data_stream)
+    fig_drift.add_trace(go.Scatter(
+        x=x_curve, 
+        y=stats.norm.pdf(x_curve, live_mean, live_std),
+        mode='lines',
+        line=dict(color=live_color, width=3),
+        name='Live Data Bell Curve'
+    ))
+
+    fig_drift.update_layout(
+        barmode='overlay', 
+        height=400, 
+        margin=dict(l=0, r=0, t=30, b=0),
+        xaxis_title="Sales Volume (Units)", 
+        yaxis_title="Probability Density",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+    
+    st.plotly_chart(fig_drift, use_container_width=True)
+    
 
 @st.cache_data(ttl=3600)
 def load_historical_data():
