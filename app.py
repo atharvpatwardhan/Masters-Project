@@ -118,8 +118,18 @@ def fetch_live_mongo_metrics():
 live_data = fetch_live_mongo_metrics()
 
 # Extract the static forecast expectations from the S3 model data
-latest_forecast = df['Expected_Forecast'].iloc[-1] if not df.empty else 0
-p95_boundary = df['Upper_Bound_95CI'].iloc[-1] if not df.empty else 0
+# latest_forecast = df['Expected_Forecast'].iloc[-1] if not df.empty else 0
+# p95_boundary = df['Upper_Bound_95CI'].iloc[-1] if not df.empty else 0
+if not df.empty:
+    current_demo_date = pd.to_datetime("2026-05-06") 
+    
+    closest_idx = (df['Date'] - current_demo_date).abs().idxmin()
+    
+    latest_forecast = df.loc[closest_idx, 'Expected_Forecast']
+    p95_boundary = df.loc[closest_idx, 'Upper_Bound_95CI']
+else:
+    latest_forecast = 0
+    p95_boundary = 0
 
 if live_data["status"] == "success":
     curr_sales = live_data["current_sales"]
@@ -130,7 +140,6 @@ if live_data["status"] == "success":
     
     risk_ratio = (curr_sales / p95_boundary * 100) if p95_boundary > 0 else 0
     total_incidents = live_data["stockouts"] + live_data["anomalies"] + live_data["delays"]
-
     col1, col2, col3, col4, col5 = st.columns(5)
     
     with col1:
@@ -144,7 +153,7 @@ if live_data["status"] == "success":
         st.metric(
             label="Forecast Variance", 
             value=f"{int(forecast_variance):,}", 
-            delta=f"{variance_pct:.1f}% vs XGBoost",
+            delta=f"{variance_pct:.1f}%",
             delta_color="inverse" # Shows red if demand is surging higher than expected
         )
         
