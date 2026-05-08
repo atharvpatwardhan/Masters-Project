@@ -117,9 +117,6 @@ def fetch_live_mongo_metrics():
 
 live_data = fetch_live_mongo_metrics()
 
-# Extract the static forecast expectations from the S3 model data
-# latest_forecast = df['Expected_Forecast'].iloc[-1] if not df.empty else 0
-# p95_boundary = df['Upper_Bound_95CI'].iloc[-1] if not df.empty else 0
 if not df.empty:
     current_demo_date = pd.to_datetime("2026-05-06") 
     
@@ -167,7 +164,7 @@ if live_data["status"] == "success":
         
     with col4:
         st.metric(
-            label="Active Grid Incidents", 
+            label="Anomaly Incidents", 
             value=f"{total_incidents}", 
             delta=f"{live_data['stockouts']} Stockouts",
             delta_color="inverse"
@@ -493,6 +490,151 @@ df_history = load_historical_data()
 
 
 
+# st.divider()
+# st.markdown("### AI Assistant")
+
+# try:
+#     mongo_client = pymongo.MongoClient(MONGO_URI, serverSelectionTimeoutMS=2000)
+#     db = mongo_client["supply_chain"]
+#     events_collection = db["supply_chain_data"]
+# except Exception as e:
+#     st.warning(f"Database connection not established. MongoDB queries will be disabled. Error: {e}")
+
+
+# def execute_dynamic_mongo_query(pipeline_json_str: str) -> str:
+#     """Executes a MongoDB aggregation pipeline."""
+#     try:
+#         pipeline = json_util.loads(pipeline_json_str)
+        
+#         forbidden_ops = ["$out", "$merge", "$lookup"]
+#         for stage in pipeline:
+#             for op in forbidden_ops:
+#                 if op in stage:
+#                     return f"Security Exception: The '{op}' operator is blocked."
+        
+#         pipeline.append({"$limit": 50})
+        
+#         cursor = events_collection.aggregate(pipeline)
+#         results = list(cursor)
+        
+#         return json_util.dumps(results)
+
+#     except Exception as e:
+#         return f"Database Execution Error: {str(e)}"
+
+
+# @st.cache_data(ttl=3600)
+# def get_combined_system_instruction():
+#     """Merges CSV forecast data with the MongoDB Schema instructions."""
+    
+#     try:
+#         df_forecast = pd.read_csv('model_v4_probabilistic_asymmetric_output.csv')
+#         latest_prediction = df_forecast.iloc[-1]
+#         forecast_context = f"""
+#         LATEST FORECAST (SKU 22197):
+#         - Expected: {latest_prediction.get('Expected_Forecast', 'N/A')} units
+#         - P95 (Overstock): {latest_prediction.get('P95_Forecast', 'N/A')} units
+#         - P05 (Stockout): {latest_prediction.get('P05_Forecast', 'N/A')} units
+#         """
+#     except Exception:
+#         forecast_context = "Forecast data unavailable."
+
+#     current_time = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+#     instruction = f"""
+#     You are an autonomous Supply Chain Co-Pilot.
+    
+#     CURRENT SYSTEM TIME: {current_time}
+    
+#     {forecast_context}
+    
+#     You have a tool called `execute_dynamic_mongo_query` to query a live MongoDB database.
+    
+#     MONGODB SCHEMA ('emergency_events' collection):
+#     - `timestamp` (ISODate)
+#     - `event_type` (String): e.g., "normal_sale", "restock", "delay", "anomaly", "stockout"
+#     - `product_id` (String): Always "22197"
+#     - `severity` (Integer): Scale of 1 to 5
+#     - `quantity` (Integer): Units impacted
+#     - `description` (String)
+#     - `location` (String): e.g,"Northampton Fulfillment Centre","Warrington Regional Cross-Dock","Dartford Last-Mile Depot","Felixstowe Port Intake","M1 Transit Corridor"
+    
+#     CRITICAL DATABASE RULES:
+#     1. If a user asks about events, write a strictly formatted JSON array representing a MongoDB aggregation pipeline.
+#     2. DATE FILTERING: Because `timestamp` is an ISODate, you MUST use the MongoDB extended JSON format `$date` operator for any time-based queries.
+#        Example: {{"$match": {{"timestamp": {{"$gte": {{"$date": "2026-04-01T00:00:00Z"}}}}}}}}
+#     3. Never use standard strings for date comparisons.
+
+#     Always be friendly and provide as much information as possible.
+#     """
+#     return instruction
+
+# API_KEY = os.getenv("GEMINI_API_KEY")
+# try:
+#     client = genai.Client(api_key=API_KEY)
+    
+#     if "messages" not in st.session_state:
+#         st.session_state.messages = [
+#             {"role": "assistant", "content": "I am synced with your forecasting model and connected to live MongoDB event streams. How can I help?"}
+#         ]
+
+#     if "chat_session" not in st.session_state:
+#         config = types.GenerateContentConfig(
+#             system_instruction=get_combined_system_instruction(),
+#             tools=[execute_dynamic_mongo_query], 
+#             temperature=0.1
+#         )
+#         st.session_state.chat_session = client.chats.create(
+#             model='gemini-2.5-flash',
+#             config=config
+#         )
+
+#     for message in st.session_state.messages:
+#         with st.chat_message(message["role"]):
+#             st.markdown(message["content"])
+
+#     if prompt := st.chat_input("Ask about pipeline forecasts or real-time anomalies..."):
+#         with st.chat_message("user"):
+#             st.markdown(prompt)
+#         st.session_state.messages.append({"role": "user", "content": prompt})
+
+#         with st.chat_message("assistant"):
+#             # --- EXPONENTIAL BACKOFF RETRY LOOP ---
+#             max_retries = 3
+#             base_delay = 2 # seconds
+#             success = False
+            
+#             for attempt in range(max_retries):
+#                 try:
+#                     # The spinner keeps the UI looking professional even if it has to wait
+#                     status_text = "Analyzing grid events..." if attempt == 0 else f"Network busy. Re-routing request (Attempt {attempt+1}/{max_retries})..."
+                    
+#                     with st.spinner(status_text):
+#                         response = st.session_state.chat_session.send_message(prompt)
+#                         st.markdown(response.text)
+#                         st.session_state.messages.append({"role": "assistant", "content": response.text})
+#                         success = True
+#                         break # Exit the retry loop on success!
+                        
+# except Exception as e:
+#     error_msg = str(e).upper()
+#     # Check specifically for the 503 Overload error
+#     if "503" in error_msg or "UNAVAILABLE" in error_msg:
+#         if attempt < max_retries - 1:
+#             sleep_time = base_delay * (2 ** attempt) # Waits 2s, then 4s
+#             time.sleep(sleep_time)
+#         else:
+#             st.error("The AI engine is currently experiencing peak demand. Please try your query again in a few moments.")
+#     else:
+#         # If it's a different error (like a 400 Bad Request), surface it immediately
+#         st.error(f"An unexpected error occurred: {e}")
+#         break 
+            
+# # Clean up the chat UI if the API completely failed after all retries
+# if not success:
+#     st.session_state.messages.pop()
+
+
 st.divider()
 st.markdown("### AI Assistant")
 
@@ -502,7 +644,6 @@ try:
     events_collection = db["supply_chain_data"]
 except Exception as e:
     st.warning(f"Database connection not established. MongoDB queries will be disabled. Error: {e}")
-
 
 def execute_dynamic_mongo_query(pipeline_json_str: str) -> str:
     """Executes a MongoDB aggregation pipeline."""
@@ -525,13 +666,11 @@ def execute_dynamic_mongo_query(pipeline_json_str: str) -> str:
     except Exception as e:
         return f"Database Execution Error: {str(e)}"
 
-
 @st.cache_data(ttl=3600)
 def get_combined_system_instruction():
     """Merges CSV forecast data with the MongoDB Schema instructions."""
-    
     try:
-        df_forecast = pd.read_csv('model_v4_probabilistic_asymmetric_output.csv')
+        df_forecast = pd.read_csv('model_v7_2026_forecast.csv') # Updated to your v7!
         latest_prediction = df_forecast.iloc[-1]
         forecast_context = f"""
         LATEST FORECAST (SKU 22197):
@@ -573,6 +712,7 @@ def get_combined_system_instruction():
     return instruction
 
 API_KEY = os.getenv("GEMINI_API_KEY")
+
 try:
     client = genai.Client(api_key=API_KEY)
     
@@ -602,10 +742,35 @@ try:
         st.session_state.messages.append({"role": "user", "content": prompt})
 
         with st.chat_message("assistant"):
-            response = st.session_state.chat_session.send_message(prompt)
-            st.markdown(response.text)
+            max_retries = 3
+            base_delay = 2
+            success = False
             
-        st.session_state.messages.append({"role": "assistant", "content": response.text})
+            for attempt in range(max_retries):
+                try:
+                    status_text = "Analyzing grid events..." if attempt == 0 else f"Network busy. Re-routing request (Attempt {attempt+1}/{max_retries})..."
+                    
+                    with st.spinner(status_text):
+                        response = st.session_state.chat_session.send_message(prompt)
+                        st.markdown(response.text)
+                        st.session_state.messages.append({"role": "assistant", "content": response.text})
+                        success = True
+                        break
+                        
+                except Exception as e:
+                    error_msg = str(e).upper()
+                    if "503" in error_msg or "UNAVAILABLE" in error_msg:
+                        if attempt < max_retries - 1:
+                            sleep_time = base_delay * (2 ** attempt) 
+                            time.sleep(sleep_time)
+                        else:
+                            st.error("The AI engine is currently experiencing peak demand. Please try your query again in a few moments.")
+                    else:
+                        st.error(f"An unexpected error occurred: {e}")
+                        break 
+            
+            if not success:
+                st.session_state.messages.pop()
 
 except Exception as e:
     st.error(f"Failed to initialize AI Assistant. Please check your API key. Error: {e}")
