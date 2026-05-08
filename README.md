@@ -50,8 +50,8 @@ The crown jewel of the platform is the **Gemini AI Co-Pilot**. Instead of forcin
 
 **1. Clone the repository:**
 ```bash
-git clone [https://github.com/yourusername/ai-supply-chain-assistant.git](https://github.com/yourusername/ai-supply-chain-assistant.git)
-cd ai-supply-chain-assistant
+git clone [https://github.com/atharvpatwardhan/Masters-Project.git](https://github.com/atharvpatwardhan/Masters-Project.git)
+cd Masters-Project
 ```
 
 **2. Install dependencies:**
